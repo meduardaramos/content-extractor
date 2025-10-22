@@ -315,7 +315,7 @@ def gerar_excel():
 
         df = pd.DataFrame(dados)
         
-        colunas_esperadas = ['tipologia', 'codigo', 'descricao', 'paviemnto','quantidade']
+        colunas_esperadas = ['tipologia', 'codigo', 'descricao', 'pavimento','quantidade']
         for col in colunas_esperadas:
             if col not in df.columns:
                 df[col] = ''
