@@ -270,9 +270,12 @@ def processar_pdf():
         codigos_vistos = set()
         
         for item in todos_dados:
-            codigo = item.get('codigo', '')
+            # Converte para string para evitar TypeError com tipos inesperados
+            codigo = str(item.get('codigo') or '')
+            descricao = str(item.get('descricao') or '')
+            
             # Cria uma chave única baseada em código e descrição
-            chave = f"{codigo}_{item.get('descricao', '')[:50]}"
+            chave = f"{codigo}_{descricao[:50]}"
             
             if chave not in codigos_vistos:
                 codigos_vistos.add(chave)
