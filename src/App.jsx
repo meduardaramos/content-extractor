@@ -60,6 +60,7 @@ function App() {
       formData.append('file', file)
 
       const response = await fetch('http://localhost:8000/api/processar-pdf', {
+      const response = await fetch('/api/processar-pdf', {
         method: 'POST',
         body: formData,
       })
@@ -110,7 +111,7 @@ function App() {
     if (dados.length === 0) return
 
     try {
-      const response = await fetch('http://localhost:8000/api/gerar-excel', {
+      const response = await fetch('/api/gerar-excel', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
