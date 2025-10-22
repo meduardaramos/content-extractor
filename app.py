@@ -31,6 +31,41 @@ client = Anthropic(api_key=anthropic_key) if anthropic_key else None
 DEFAULT_MODEL_STR = "claude-sonnet-4-20250514"
 # </important_do_not_delete>
 
+def dividir_texto_em_chunks(texto, tamanho_chunk=12000, overlap=1000):
+    """
+    Divide o texto em chunks com overlap para não perder contexto entre seções
+    
+    Args:
+        texto: Texto completo a ser dividido
+        tamanho_chunk: Tamanho de cada chunk em caracteres
+        overlap: Quantidade de caracteres que se sobrepõem entre chunks
+    
+    Returns:
+        Lista de chunks de texto
+    """
+    if len(texto) <= tamanho_chunk:
+        return [texto]
+    
+    chunks = []
+    inicio = 0
+    
+    while inicio < len(texto):
+        fim = inicio + tamanho_chunk
+        
+        # Se não é o último chunk, tenta quebrar em uma quebra de linha
+        if fim < len(texto):
+            # Procura por quebra de linha próxima ao fim
+            quebra = texto.rfind('\n', inicio, fim)
+            if quebra > inicio + tamanho_chunk // 2:  # Só usa a quebra se estiver na segunda metade
+                fim = quebra
+        
+        chunks.append(texto[inicio:fim])
+        
+        # Próximo chunk começa com overlap
+        inicio = fim - overlap if fim < len(texto) else fim
+    
+    return chunks
+
 def extrair_json_robusto(texto):
     """
     Extrai JSON de forma robusta, lidando com múltiplos formatos de resposta da Claude API
@@ -91,6 +126,70 @@ def extrair_json_robusto(texto):
     
     return None
 
+def processar_chunk_com_ia(chunk_texto, numero_chunk, total_chunks):
+    """
+    Processa um chunk de texto com a Claude API
+    
+    Args:
+        chunk_texto: Texto do chunk a processar
+        numero_chunk: Número do chunk atual (1-based)
+        total_chunks: Total de chunks
+    
+    Returns:
+        Lista de dados extraídos ou None em caso de erro
+    """
+    contexto_chunk = f"\n\n[SEÇÃO {numero_chunk} de {total_chunks}]" if total_chunks > 1 else ""
+    
+    prompt = f"""Analise este manual de sinalização e extraia os dados em formato JSON.{contexto_chunk}
+
+Retorne APENAS um objeto JSON válido (sem markdown, sem explicações) com a seguinte estrutura:
+{{
+  "dados": [
+    {{
+      "tipologia": "string (formato X.YY tipo de sinalização)",
+      "codigo": "string",
+      "descricao": "string (conteúdo da sinalização)",
+      "pavimento": "string",
+      "quantidade": "número"
+    }}
+  ]
+}}
+
+REGRAS:
+- Se quantidade não estiver especificada, use 0
+- Utilize o texto do conteúdo da peça como descrição
+- Retorne apenas JSON válido, sem texto adicional
+- Extraia TODOS os itens de sinalização que encontrar nesta seção
+
+Texto do PDF:
+{chunk_texto}"""
+
+    try:
+        message = client.messages.create(
+            model=DEFAULT_MODEL_STR,
+            max_tokens=8192,  # Aumentado para suportar mais dados
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        content_block = message.content[0]
+        if hasattr(content_block, 'text'):
+            resposta_texto = content_block.text.strip()
+        else:
+            return None
+        
+        dados_json = extrair_json_robusto(resposta_texto)
+        
+        if dados_json and 'dados' in dados_json:
+            return dados_json['dados']
+        
+        return []
+        
+    except Exception as e:
+        print(f"Erro ao processar chunk {numero_chunk}: {str(e)}", file=sys.stderr)
+        return None
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -102,7 +201,7 @@ def health_check():
 
 @app.route('/api/processar-pdf', methods=['POST'])
 def processar_pdf():
-    """Processa PDF e extrai dados de sinalização usando Claude API"""
+    """Processa PDF e extrai dados de sinalização usando Claude API com processamento em chunks"""
     try:
         if not client:
             return jsonify({
@@ -126,14 +225,15 @@ def processar_pdf():
                 'error': 'Apenas arquivos PDF são aceitos'
             }), 400
 
+        # Extrai texto do PDF
         pdf_bytes = file.read()
-        
         pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
         texto_completo = ""
         
         for page_num in range(len(pdf_document)):
             page = pdf_document[page_num]
             texto_completo += page.get_text()
+            texto_completo += f"\n\n--- Página {page_num + 1} ---\n\n"  # Marcador de página
         
         pdf_document.close()
 
@@ -142,62 +242,62 @@ def processar_pdf():
                 'error': 'PDF não contém texto extraível'
             }), 400
 
-        prompt = """Analise este manual de sinalização e extraia os dados em formato JSON.
-
-Retorne APENAS um objeto JSON válido (sem markdown, sem explicações) com a seguinte estrutura:
-{
-  "dados": [
-    {
-      "tipologia": "string (formato X.YY tipo de sinalização)",
-      "codigo": "string",
-      "descricao": "string (conteúdo da sinalização)",
-      "pavimento": "string",
-      "quantidade": "número",
-    }
-  ]
-}
-
-REGRAS:
-- Se quantidade não estiver especificada, use 0
-- Utilize o texto do conteúdo da peça como descrição
-- Retorne apenas JSON válido, sem texto adicional
-
-Texto do PDF:
-""" + texto_completo[:15000]
-
-        message = client.messages.create(
-            model=DEFAULT_MODEL_STR,
-            max_tokens=4096,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        content_block = message.content[0]
-        if hasattr(content_block, 'text'):
-            resposta_texto = content_block.text.strip()
-        else:
-            return jsonify({'error': 'Resposta da API em formato inesperado'}), 500
+        # Divide o texto em chunks
+        chunks = dividir_texto_em_chunks(texto_completo, tamanho_chunk=12000, overlap=1000)
+        total_chunks = len(chunks)
         
-        dados_json = extrair_json_robusto(resposta_texto)
+        print(f"PDF dividido em {total_chunks} chunk(s)", file=sys.stderr)
         
-        if dados_json is None:
-            return jsonify({
-                'error': 'Não foi possível extrair JSON válido da resposta',
-                'raw_response': resposta_texto[:500]
-            }), 500
+        # Processa cada chunk e acumula os resultados
+        todos_dados = []
+        chunks_com_erro = []
+        
+        for i, chunk in enumerate(chunks):
+            numero_chunk = i + 1
+            print(f"Processando chunk {numero_chunk}/{total_chunks}...", file=sys.stderr)
+            
+            dados_chunk = processar_chunk_com_ia(chunk, numero_chunk, total_chunks)
+            
+            if dados_chunk is None:
+                chunks_com_erro.append(numero_chunk)
+                print(f"Erro ao processar chunk {numero_chunk}", file=sys.stderr)
+            elif dados_chunk:
+                todos_dados.extend(dados_chunk)
+                print(f"Chunk {numero_chunk}: {len(dados_chunk)} itens extraídos", file=sys.stderr)
+        
+        # Remove duplicatas baseado em código (se existir)
+        dados_unicos = []
+        codigos_vistos = set()
+        
+        for item in todos_dados:
+            # Converte para string para evitar TypeError com tipos inesperados
+            codigo = str(item.get('codigo') or '')
+            descricao = str(item.get('descricao') or '')
+            
+            # Cria uma chave única baseada em código e descrição
+            chave = f"{codigo}_{descricao[:50]}"
+            
+            if chave not in codigos_vistos:
+                codigos_vistos.add(chave)
+                dados_unicos.append(item)
+        
+        print(f"Total de itens extraídos: {len(todos_dados)}", file=sys.stderr)
+        print(f"Itens únicos após remoção de duplicatas: {len(dados_unicos)}", file=sys.stderr)
+        
+        resposta = {
+            'dados': dados_unicos,
+            'metadata': {
+                'total_chunks': total_chunks,
+                'chunks_processados': total_chunks - len(chunks_com_erro),
+                'chunks_com_erro': chunks_com_erro if chunks_com_erro else None,
+                'total_itens': len(dados_unicos)
+            }
+        }
 
-        if 'dados' not in dados_json:
-            dados_json = {'dados': []}
+        return jsonify(resposta)
 
-        return jsonify(dados_json)
-
-    except json.JSONDecodeError as e:
-        return jsonify({
-            'error': f'Erro ao processar resposta da API: {str(e)}',
-            'raw_response': resposta_texto[:500] if 'resposta_texto' in locals() else 'N/A'
-        }), 500
     except Exception as e:
+        print(f"Erro geral: {str(e)}", file=sys.stderr)
         return jsonify({
             'error': f'Erro ao processar PDF: {str(e)}'
         }), 500
